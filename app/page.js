@@ -316,12 +316,17 @@ export default function LaneLog() {
         const res = await fetch("/api/records");
         if (res.status === 401) { router.push("/login"); return; }
         const data = await res.json();
+        if (!res.ok) {
+          console.error("Failed to load records:", data?.error);
+          setSaveError(true);
+          return;
+        }
         const migrated = migrateData(data.value);
         migrated.children = migrated.children.map((c) => ({ ...c, records: (c.records || []).map(migrateRecord) }));
         setChildren(migrated.children);
         if (migrated.children.length > 0) setActiveChildId(migrated.children[0].id);
       } catch (e) {
-        // start empty if fetch fails
+        setSaveError(true);
       } finally {
         setLoading(false);
       }
