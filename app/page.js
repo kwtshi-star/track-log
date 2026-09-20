@@ -5,10 +5,11 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, ReferenceLine
 } from "recharts";
+import Papa from "papaparse";
 import {
   Plus, X, Trophy, TrendingUp, Video,
   Trash2, ChevronDown, Wind, CloudSun, Pencil, Settings, AlertTriangle,
-  LogOut, Users, MapPin, Download, Target
+  LogOut, Users, MapPin, Download, Target, Upload
 } from "lucide-react";
 import { useRouter } from "next/navigation";
 
@@ -121,6 +122,61 @@ function downloadCSV(records, childName) {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+// エクスポートしたCSV（recordsToCSVと同じ列構成）を記録オブジェクトの配列に戻す。
+function csvRowToRecord(row) {
+  const get = (k) => (row[k] || "").trim();
+  const eventType = get("種目タイプ") === "跳躍" ? "field" : "track";
+  const record = {
+    id: uid(),
+    date: get("日付"),
+    event: get("種目"),
+    eventType,
+    meet: get("大会・記録会名"),
+    venue: get("開催場所"),
+    round: get("予選/決勝"),
+    wind: get("風"),
+    weather: get("天候"),
+    memo: get("メモ"),
+  };
+  if (eventType === "track") {
+    record.time = get("タイム");
+    record.lane = get("レーン");
+    record.videoUrl = get("動画リンク");
+  } else {
+    const attempts = [];
+    for (let i = 1; i <= 3; i++) {
+      const distance = get(`${i}本目距離(m)`);
+      if (distance) {
+        attempts.push({
+          distance,
+          wind: get(`${i}本目風`),
+          videoUrl: get(`${i}本目動画`),
+        });
+      }
+    }
+    record.attempts = attempts;
+  }
+  return record;
+}
+
+// "lanelog_さき_2026-09-06.csv" -> "さき"
+function guessChildNameFromFilename(filename) {
+  const noExt = filename.replace(/\.csv$/i, "");
+  const m = noExt.match(/^lanelog_(.+?)_\d{4}-\d{2}-\d{2}$/i);
+  return (m ? m[1] : noExt).trim() || "インポート";
+}
+
+function parseCsvFile(file) {
+  return new Promise((resolve, reject) => {
+    Papa.parse(file, {
+      header: true,
+      skipEmptyLines: true,
+      complete: (results) => resolve(results.data),
+      error: reject,
+    });
+  });
 }
 
 function getEmbedInfo(url) {
@@ -251,6 +307,8 @@ export default function LaneLog() {
   const [confirmClear, setConfirmClear] = useState(false);
   const [standardsOpen, setStandardsOpen] = useState(false);
   const [standardsDraft, setStandardsDraft] = useState({ soutai: "", tsushin: "", shinjin: "" });
+  const [importing, setImporting] = useState(false);
+  const [importSummary, setImportSummary] = useState(null);
 
   useEffect(() => {
     (async () => {
@@ -451,6 +509,39 @@ export default function LaneLog() {
     setChildren(nextChildren);
     setStandardsOpen(false);
     await persist(nextChildren);
+  };
+
+  const handleImportFiles = async (fileList) => {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    setImporting(true);
+    setImportSummary(null);
+    try {
+      let nextChildren = [...children];
+      const lines = [];
+      for (const file of files) {
+        const rows = await parseCsvFile(file);
+        const records = rows.filter((r) => (r["日付"] || "").trim()).map(csvRowToRecord);
+        const name = guessChildNameFromFilename(file.name);
+        const existing = nextChildren.find((c) => c.name === name);
+        if (existing) {
+          nextChildren = nextChildren.map((c) =>
+            c.id === existing.id ? { ...c, records: [...c.records, ...records] } : c
+          );
+        } else {
+          nextChildren = [...nextChildren, { id: uid(), name, records }];
+        }
+        lines.push(`${name}: ${records.length}件`);
+      }
+      setChildren(nextChildren);
+      if (!activeChildId && nextChildren.length) setActiveChildId(nextChildren[0].id);
+      await persist(nextChildren);
+      setImportSummary(lines.join(" / "));
+    } catch (e) {
+      setImportSummary(`取り込みに失敗しました: ${String(e)}`);
+    } finally {
+      setImporting(false);
+    }
   };
 
   if (loading) {
@@ -824,6 +915,25 @@ export default function LaneLog() {
               >
                 <Download size={13} /> {activeChild?.name ? `${activeChild.name}の記録をCSVでダウンロード` : "記録をCSVでダウンロード"}
               </button>
+            </div>
+
+            <div style={{ marginTop: 20, paddingTop: 16, borderTop: "1px solid #EEF0EA" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 13, color: "#4A4D42", marginBottom: 6 }}>
+                <Upload size={13} /> CSVから復元・追加
+              </div>
+              <p style={{ fontSize: 11, color: "#A5A89C", margin: "0 0 8px" }}>
+                このアプリから書き出したCSVを選ぶと、ファイル名（例: lanelog_さき_2026-09-06.csv → 「さき」）から子供を判定して記録を追加します。同名の子供がいれば追記、いなければ新規作成します。複数ファイルをまとめて選択できます。
+              </p>
+              <input
+                type="file"
+                accept=".csv"
+                multiple
+                disabled={importing}
+                onChange={(e) => { handleImportFiles(e.target.files); e.target.value = ""; }}
+                style={{ fontSize: 12 }}
+              />
+              {importing && <p style={{ fontSize: 12, color: "#7A7D72", marginTop: 6 }}>取り込み中…</p>}
+              {importSummary && <p style={{ fontSize: 12, color: "#3F6B4A", marginTop: 6, whiteSpace: "pre-wrap" }}>{importSummary}</p>}
             </div>
 
             <div style={{ marginTop: 24, paddingTop: 16, borderTop: "1px solid #EEF0EA" }}>

@@ -16,38 +16,86 @@ function isAuthed(request) {
   return cookie && cookie === process.env.APP_PASSWORD;
 }
 
+// 環境変数に末尾スラッシュや余計な空白、うっかり付けた /rest/v1 などが
+// 含まれていても動くように整形する（PGRST125 対策）。
+function normalizeSupabaseUrl(raw) {
+  let url = String(raw).trim();
+  url = url.replace(/\/+$/, "");           // 末尾のスラッシュを除去
+  url = url.replace(/\/rest\/v1$/, "");    // 末尾の /rest/v1 を除去
+  return url;
+}
+
 export async function GET(request) {
   if (!isAuthed(request)) {
     return NextResponse.json({ error: "unauthorized" }, { status: 401 });
   }
 
-  const supabaseUrl = process.env.MIGRATE_SUPABASE_URL;
-  const supabaseKey = process.env.MIGRATE_SUPABASE_SERVICE_KEY;
-  if (!supabaseUrl || !supabaseKey) {
+  const rawUrl = process.env.MIGRATE_SUPABASE_URL;
+  const supabaseKey = process.env.MIGRATE_SUPABASE_SERVICE_KEY?.trim();
+  if (!rawUrl || !supabaseKey) {
     return NextResponse.json(
       { error: "MIGRATE_SUPABASE_URL と MIGRATE_SUPABASE_SERVICE_KEY をVercelの環境変数に設定してから、再デプロイしてください。" },
       { status: 400 }
     );
   }
 
+  const supabaseUrl = normalizeSupabaseUrl(rawUrl);
+  const { searchParams } = new URL(request.url);
+  const table = searchParams.get("table") || "kv_store";
+  const requestUrl = `${supabaseUrl}/rest/v1/${table}?select=*`;
+
   try {
-    const res = await fetch(
-      `${supabaseUrl}/rest/v1/kv_store?key=eq.${KEY}&select=value`,
-      { headers: { apikey: supabaseKey, Authorization: `Bearer ${supabaseKey}` } }
-    );
+    const res = await fetch(requestUrl, {
+      headers: { apikey: supabaseKey, Authorization: `Bearer ${supabaseKey}` },
+    });
     if (!res.ok) {
       const text = await res.text();
-      throw new Error(`Supabaseからの取得に失敗しました (status ${res.status}): ${text}`);
+      throw new Error(
+        `Supabaseからの取得に失敗しました (status ${res.status}): ${text} / 問い合わせ先: ${requestUrl}`
+      );
     }
     const rows = await res.json();
-    const value = rows?.[0]?.value;
-    if (!value) {
-      return NextResponse.json({ error: "Supabase側にデータが見つかりませんでした。" }, { status: 404 });
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return NextResponse.json(
+        { error: `テーブル "${table}" にデータが見つかりませんでした。`, requestUrl },
+        { status: 404 }
+      );
     }
 
-    const { searchParams } = new URL(request.url);
-    const force = searchParams.get("force") === "1";
+    // key列がある場合は該当行を、無い場合は最初の行を使う。
+    const row = rows.find((r) => r?.key === KEY) || rows[0];
+    const value = row?.value ?? row;
 
+    if (!value || typeof value !== "object") {
+      return NextResponse.json(
+        { error: "取得できましたが、記録データの形式が想定と異なります。", sample: row },
+        { status: 422 }
+      );
+    }
+
+    // 旧形式（{athleteName, records}）なら新形式（{children:[...]}）に変換する。
+    let normalized = value;
+    if (!Array.isArray(value.children) && Array.isArray(value.records)) {
+      normalized = {
+        children: [
+          {
+            id: Date.now().toString(36),
+            name: value.athleteName || "",
+            records: value.records,
+          },
+        ],
+      };
+    }
+
+    if (!Array.isArray(normalized.children)) {
+      return NextResponse.json(
+        { error: "記録データの形式が想定と異なります（children配列が見つかりません）。", sample: value },
+        { status: 422 }
+      );
+    }
+
+    const force = searchParams.get("force") === "1";
     const existing = await readData();
     const existingChildrenCount = existing?.children?.length || 0;
 
@@ -61,10 +109,13 @@ export async function GET(request) {
       );
     }
 
-    await writeData(value);
+    await writeData(normalized);
 
-    const childrenCount = value.children?.length || 0;
-    const recordsCount = (value.children || []).reduce((sum, c) => sum + (c.records?.length || 0), 0);
+    const childrenCount = normalized.children.length;
+    const recordsCount = normalized.children.reduce(
+      (sum, c) => sum + (c.records?.length || 0),
+      0
+    );
 
     return NextResponse.json({
       ok: true,
